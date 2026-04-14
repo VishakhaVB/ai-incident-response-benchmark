@@ -1,0 +1,23 @@
+name: autonomous-incident-response-env
+
+description: Autonomous Incident Response Benchmark Environment for evaluating AI agents on structured runbook execution and decision-making
+
+env: env.RunbookEnv
+
+tasks:
+  - easy
+  - medium
+  - hard
+
+metadata:
+  version: "1.0.0"
+  author: bytebrains
+  difficulty_levels:
+    - easy
+    - medium
+    - hard
+
+settings:
+  max_steps: 7
+  reward_type: progress_based
+  deterministic: true
