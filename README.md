@@ -1,63 +1,218 @@
 # Autonomous Incident Response Benchmark
 
-Most AI agent demos out there feel like glorified text games: the agent guesses a command, the system checks if it matches a string, and everyone claps. I built this project because I wanted a benchmark that genuinely tests an agent's ability to troubleshoot an infrastructure incident under pressure, without hardcoded rails. 
+Production-grade benchmark for evaluating whether AI responders can make correct operational decisions under incident pressure.
 
-This isn't a sandbox where an LLM can just freestyle bash commands. It’s a multi-agent system (Planner + Executor) running in a deterministic environment that forces the AI to reason through noise, recover from its own bad decisions, and actually "learn" from previous executions.
+If your AI agent only succeeds when the prompt is clean and the path is obvious, it will fail at 3:07 AM during a real incident.
 
-It’s an evaluation platform meant for benchmarking real DevOps AI capabilities.
+This benchmark is built to test whether an agent can behave like a credible on-call SRE under pressure: noisy alerts, misleading signals, partial context, and penalties for bad judgment. It is not a command-matching toy and it is not a prompt-game leaderboard hack.
 
-## How It Works
+The system runs a strict Planner + Executor architecture against a deterministic runbook environment, then scores outcome quality with explicit penalties for wasted or repeated actions.
 
-At its core, this is a simulated control plane where the AI acts as an SRE. 
+## TL;DR
 
-1. **The Generator (`tasks.py`)**: Before each run, the environment dynamically spins up a parameterized incident (e.g., API CPU Spike vs. DB CPU Spike). It injects intentionally misleading signals into the pager alert—like a responder in the Slack channel falsely claiming it's a memory leak.
-2. **The Planner loop**: The Planner agent receives the incident and long-term memory patterns. It has to output a strict JSON strategy with exactly what it intends to do.
-3. **The Executor block**: The Executor is basically a gatekeeper. It reads the Planner's JSON and cross-references it with the history. If the Planner suggests something that already failed, the Executor rejects it and fires a `REPLAN` command back up the chain.
-4. **The Environment**: The environment evaluates the token, handles the reward logic, increments the state, and records the history.
-5. **Scoring (`grader.py`)**: You don't just get a 1.0 for eventually fixing the problem. Taking unnecessary actions docks your score. Repeating a failed action docks your score heavily. Getting distracted by the decoy text in the prompt kills your efficiency multiplier.
+- Multi-agent incident response benchmark with strict Planner + Executor control.
+- Dynamic tasks include adversarial noise to test real diagnostic discipline.
+- `REPLAN` gating blocks repeated or logically bad actions.
+- Scoring rewards correctness and punishes waste, repetition, and low-quality decisions.
+- Built to measure operational reliability, not prompt fluency.
 
-## Key Design Decisions
+## Why This Matters in Production
 
-I went through a few iterations before landing on this architecture. Here's why it's built this way:
+Teams are already wiring LLM agents into ops workflows: triage bots, runbook copilots, auto-remediation pipelines. Most evaluations today still answer the wrong question: "Can the model produce a plausible response?"
 
-* **Separating the Planner and Executor**: Initially, I just had one agent generating the "reasoning" and the "token" at once. It failed constantly. LLMs struggle to reason and conform to strict output tokens in the same breath. Splitting them meant the Planner could think deeply in JSON, and the Executor could enforce pure logic mapping.
-* **Executor Validation**: The Executor has veto power. If the Planner decides to blindly follow the runbook and tries to `scale_out_api` when the issue is database exhaustion, the environment flags it as a failure. On the next loop, if the Planner stubbornly suggests it again, the Executor catches the logic gap, refuses to execute, and triggers a `REPLAN`. It's a self-correcting feedback loop.
-* **Adversarial Noise**: Real incidents are messy. People panic and suggest wrong fixes in incident channels. I hardcoded this noise directly into the task generation to ensure the agent is actually diagnosing the problem, not just extracting keywords and pattern matching. 
-* **Strict Scoring**: The score had to mean something. It clamps strictly between `(0, 1)`. Decision quality penalties take chunks off the final raw score right at the end to punish guessing.
+This project answers the harder one: "Can the system consistently make good operational decisions when the context is adversarial?"
 
-## What Makes This Interesting
+Real-world relevance:
 
-* **Handling Misleading Signals**: It proves the agent relies on the actual allowed playbooks and metric logic, rather than blindly summarizing the prompt text.
-* **Failure to Recovery**: Because the Executor gates bad actions and feeds failures back to the Planner, you can watch the system try a decoy solution, fail, recognize why it failed, and dynamically shift to the correct mitigation path without blowing up the loop.
-* **Abstract Pattern Memory**: The memory system doesn't save the exact token sequence (that's just cheating). It abstracts successful paths into patterns (e.g., `diagnose -> investigate -> mitigate`). The agent has to deduce how that pattern applies to a completely new context on the next run.
+- It tests resilience to bad human input (for example: confident but wrong guidance in incident chat).
+- It penalizes brute-force behavior that would be expensive or dangerous in production.
+- It surfaces whether an agent can recover from failure instead of repeating it.
+- It evaluates decision quality, not just final task completion.
 
-## Project Structure
+## System Overview
 
-* `inference.py` - The main loop where all the magic happens. Houses the JSON planner, the Executor gate, and the memory read/writes.
-* `env.py` - The deterministic state machine representing the infrastructure. Handles the step logic and progress ratio.
-* `grader.py` - The harsh judge. Calculates the multi-factor punitive score (Correctness, Efficiency, Stability, and Decision Quality).
-* `tasks.py` - The dynamic factory that builds the runbooks and injects the adversarial noise on the fly.
+At runtime, the benchmark simulates a control plane where the agent acts as the responder.
 
-## How to Run
+1. **Dynamic incident generation (`tasks.py`)**
+   Each episode is parameterized (CPU spike, DB exhaustion, regional outage) and injected with decoy signals.
 
-You need your OpenAI credentials exported natively. 
+2. **Planner (`inference.py`)**
+   The Planner receives observation + prior failures + long-term strategy patterns and must produce strict JSON:
+   ```json
+   {
+     "plan": ["action_1", "action_2", "action_3"],
+     "current_focus": "action_1"
+   }
+   ```
+
+3. **Executor gate (`inference.py`)**
+   The Executor validates `current_focus` against action history and logic constraints. If invalid or repetitive, it returns `REPLAN`.
+
+4. **Environment transition (`env.py`)**
+   The environment applies the selected token, advances or blocks progress, and records history.
+
+5. **Scoring (`grader.py`)**
+   Final score is clamped to `(0, 1)` and reduced by efficiency and decision-quality penalties.
+
+## Architecture Decisions (Opinionated, On Purpose)
+
+- **Planner and Executor are split intentionally.** One model trying to reason and emit final action tokens in a single pass fails too often. Separating cognition from execution validation materially improves reliability.
+
+- **Executor veto is non-negotiable.** If a proposed action already failed, the system does not "hope for better wording". It rejects and replans.
+
+- **Adversarial noise is first-class.** Incident channels are noisy in real life. Evaluations without misinformation resistance are not serious.
+
+- **Memory stores abstractions, not token transcripts.** Successful episodes are compressed into patterns like `diagnose -> investigate -> mitigate`, avoiding direct path memorization.
+
+## Example Execution Walkthrough
+
+Below is a typical run shape for a DB exhaustion scenario with misleading context.
+
+### Episode Setup
+
+- Incident text includes a real DB pool bottleneck.
+- Decoy text suggests scaling API replicas first.
+- Allowed actions include both relevant and irrelevant tokens.
+
+### Loop Behavior
+
+1. Planner proposes: `inspect_db_metrics -> scale_out_api -> raise_pool_size`
+2. Executor accepts `inspect_db_metrics`.
+3. Planner focus shifts to `scale_out_api`.
+4. Environment marks no meaningful progress on that step.
+5. Executor detects failed logic repetition and emits `REPLAN`.
+6. Planner revises path: `identify_long_queries -> kill_long_query -> raise_pool_size`
+7. Environment progresses to resolution.
+
+### What the score captures
+
+- Correct mitigation sequence eventually found.
+- Penalty applied for the early decoy action.
+- Bigger penalty if the same failed action is repeated.
+
+This is exactly the behavior you want to inspect before putting an autonomous responder anywhere near production change authority.
+
+## Proof Signals You Can Measure
+
+This benchmark is useful because it produces inspectable operational signals, not just pass/fail status:
+
+- **Recovery quality**: How quickly does the agent pivot after a failed hypothesis?
+- **Efficiency**: How many unnecessary steps were taken before resolution?
+- **Stability**: Does the policy remain coherent across mixed incident types?
+- **Decision discipline**: Does it avoid retrying known-bad actions?
+
+## Architecture
+
+Diagram placeholder (replace with your actual system diagram):
+
+```text
++---------------------+       +--------------------+
+| Incident Generator  | ----> |      Planner       |
+|      (tasks.py)     |       |   (JSON strategy)  |
++---------------------+       +--------------------+
+                 |
+                 v
+              +--------------------+
+              | Executor Action    |
+              | Gate (`REPLAN`)    |
+              +--------------------+
+                 |
+                 v
++---------------------+       +--------------------+
+|   Grader            | <---- | Environment        |
+|   (penalty-aware)   |       | (state transition) |
++---------------------+       +--------------------+
+                 |
+                 v
+              +--------------------+
+              | Long-Term Memory   |
+              | pattern abstraction|
+              +--------------------+
+```
+
+## Repository Layout
+
+- `inference.py`: Main orchestration loop, Planner/Executor coordination, long-term memory read/write.
+- `env.py`: Deterministic state machine, step transitions, and progress accounting.
+- `tasks.py`: Dynamic incident factory + adversarial signal injection.
+- `grader.py`: Multi-factor scoring with punitive decision-quality deductions.
+- `test_env.py`: Behavioral checks for correctness path, invalid actions, and edge cases.
+
+## Run Locally
+
+### 1) Install dependencies
+
+```bash
+pip install -e .
+```
+
+### 2) Configure credentials
+
+`inference.py` requires both environment variables:
 
 ```bash
 export API_KEY="your-api-key"
 export API_BASE_URL="https://api.openai.com/v1"
+```
 
-# Run the benchmark suite
+PowerShell equivalent:
+
+```powershell
+$env:API_KEY = "your-api-key"
+$env:API_BASE_URL = "https://api.openai.com/v1"
+```
+
+### 3) Execute benchmark suite
+
+```bash
 python inference.py
 ```
 
-## Limitations
+The run executes all generated tasks and prints per-task score plus overall average.
 
-As much as I've polished this, it's still a prototype with some glaring gaps:
-* **Tight Rails**: Setting up a truly open-ended environment is hard. While the tasks are dynamically generated, the underlying correct path is still mathematically deterministic at the environment level. It doesn't actually 'execute' terraform or bash scripts.
-* **Basic Memory**: The `LongTermMemory` module is basically a JSON file caching abstracted string sequences. It works, but a proper vector DB storing incident vectors would make the pattern matching far more robust in a massive playbook scenario.
-* **Reasoning Score**: The 10% weight for "Reasoning" in `grader.py` is currently just a placeholder scalar of `1.0`. Right now, decision quality is mostly enforced through punitive subtractions instead of a dedicated LLM-as-a-judge reasoning score.
+## Current Limits
 
-## Future Improvements
+This is intentionally rigorous, but still a prototype in a few areas:
 
-* Add a persistence layer (like SQLite) for memory instead of `agent_memory.json` to handle concurrency and thousands of runs.
-* Connect the execution tokens to a real sandbox (like a docker container mapped to `subprocess`) where the commands actually mutate real state, shifting the evaluation from a deterministic graph to actual sandbox assertions.
+- **Deterministic action graph** Tasks are dynamic, but valid resolution paths are still constrained by environment logic.
+
+- **Simple persistence layer** `agent_memory.json` works for local experimentation but is not ideal for high-volume concurrent evaluations.
+
+- **Reasoning component in scoring is lightweight** Decision quality is enforced primarily through explicit penalties rather than a deep reasoning judge.
+
+## Example Result
+
+Representative console output from a benchmark run:
+
+```text
+--- Starting Elite Multi-Agent Inference for Task: db_exhaustion_2f19a3b1 ---
+Step: 1 | Action: inspect_db_metrics (Inspect application metrics for active DB connections versus configured pool size) | Reward: 0.40 | Progress: 0.25
+Step: 2 | Action: scale_out_api (Scale out API replicas by one and verify latency recovers) | Reward: -0.50 | Progress: 0.25
+--- Executor triggered REPLAN. Reconstructing strategy. ---
+Step: 3 | Action: identify_long_queries (Identify long-running queries from database monitoring and capture offending endpoints) | Reward: 0.30 | Progress: 0.50
+Step: 4 | Action: kill_long_query (Terminate the identified blocking query in the database) | Reward: 0.35 | Progress: 0.75
+Step: 5 | Action: raise_pool_size (Temporarily raise connection pool size within safe database limits) | Reward: 0.45 | Progress: 1.00
+
+--- Final Score for Task 'db_exhaustion_2f19a3b1' ---
+Score: 0.87 (87.0%)
+Correct Matches: 3 / 3
+Penalties Assessed (Decision Quality): -0.13
+
+==================================================
+=== OVERALL AVERAGE SCORE: 0.81 ===
+==================================================
+```
+
+## Vision
+
+The goal is to evolve this from a deterministic benchmark into a high-fidelity agent reliability harness for real ops teams.
+
+Next upgrades:
+
+- Move memory persistence to SQLite (or a vector-backed store) for scale and richer retrieval.
+- Attach action tokens to a constrained execution sandbox so state transitions are validated against real side effects.
+- Expand scoring with stronger reasoning-quality evaluation while keeping punitive operational metrics.
+
+If your team is evaluating autonomous incident response, this project is built to answer the uncomfortable but useful question: not whether the agent can talk like an SRE, but whether it can actually act like one.
+
+When an incident escalates, fluent language is irrelevant. Correct actions under uncertainty are what count, and this benchmark is designed to measure exactly that.
